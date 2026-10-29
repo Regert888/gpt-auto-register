@@ -306,17 +306,11 @@ WebUI「📱 接码配置」Tab 启用接码后，命中 add-phone 时会自动�
 - 没装 node 也能跑，但只能用于纯协议探测，**不能真发码**。
 
 ### Outlook 收件细节
-- **Junk 邮件**：OpenAI 首次发码给陌生收件人常被 outlook 反垃圾分到 Junk，本脚本扫多 folder（INBOX / Junk / Junk Email / Spam）。
-- **tm1.openai.com 影子发码**：OpenAI 当前坏掉的发码域，所有账号都返固定 OTP=493682 → verify 401。已硬过滤。
+- **Junk 邮件**：首次发码给陌生收件人常被 outlook 反垃圾分到 Junk，本脚本扫多 folder（INBOX / Junk / Junk Email / Spam）。
+- **tm1.openai.com 影子发码**： 当前坏掉的发码域，所有账号都返固定 OTP=493682 → verify 401。已硬过滤。
 - **refresh_token 自动滚动续期**：Microsoft access_token 1 天有效，本模块每 3000s 自动续期。
 
-### OpenAI 反欺诈
-- **已有账号分支**：邮箱被识为已注册时，默认 fast-fail 抛 `RuntimeError`（防 honeypot）。
-  设 `WEBUI_ALLOW_LOGIN=1` 改走 OTP login 拿凭证。
-- **`authorize/continue` 已 trigger 发码**：passwordless 模式下 OpenAI 已经发了码，
-  此时 **必须只 resend**，不能再调 `email-otp/send`（会新建 challenge → 旧 OTP 失效 → wrong_email_otp_code）。
-  脚本里 `kickoff_otp_delivery` 已根据 `_is_existing_account` 自动切分支。
-- **批量注册次日存活率约 2%**（原项目反欺诈研究数据），单号 / 偶发使用没问题。
+
 
 ### 网络层
 - **curl_cffi SOCKS5**：默认会把 `socks5://` 规范化成 `socks5h://`（DNS 走代理解析），减少 TLS 握手异常。
@@ -324,9 +318,8 @@ WebUI「📱 接码配置」Tab 启用接码后，命中 add-phone 时会自动�
 - **Cloudflare 403**：`get_csrf_token` 内置 3 次重试 + 指数 backoff。
 
 ### SMS 接码
-- **WhatsApp vs SMS**：OpenAI 自 2025 年起对大部分国家改用 WhatsApp 验证。如果租到的国家不在白名单，接码平台收不到 SMS → 超时 → cancel 退款。
 - **HeroSMS 退款机制**：HeroSMS 购买后 2 分钟内不可取消，取消后 20 分钟自动退款到余额；SmsBower 可立即取消退款。注册机中号码不可用时会立刻换号，HeroSMS 的废号等 20 分钟后自动退回。
-- **OTP validate 失败 → resend 兜底**：phone-otp/validate 401 时会自动 resend 一次再等新码（OpenAI 偶尔拒第一条码但接受第二条）。
+- **OTP validate 失败 → resend 兜底**：phone-otp/validate 401 时会自动 resend 一次再等新码。
 
 ## License
 
