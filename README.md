@@ -126,7 +126,8 @@ python register_outlook.py 'email----password----client_id----refresh_token'
 ## 代理池
 | 推荐代理服务 | 简介说明 |
 | ---- | ---- |
-| [![IPWO](https://www.ipwo.net/static/cn/images/index/black_banner_icon.webp?v=20261028)](https://www.ipwo.net/?ref=githubgptautoregister) | [IPWO 住宅代理](https://www.ipwo.net/?ref=githubgptautoregister) 覆盖全球 195+ 地区动静态 IP 资源，支持 http/https/socks5 协议，为自动化注册和多账号任务提供更多网络环境选择。适用于账号注册、浏览器自动化、Web 数据处理等场景，灵活配置不同地区代理。[免费测试入口](https://www.ipwo.net/?ref=githubgptautoregister)，90% 折扣码：`0200` |
+| [![IPWO](https://www.ipwo.net/static/cn/images/index/black_banner_icon.webp?v=20261028)](https://www.ipwo.net/?ref=githubgptautoregister) | [IPWO 住宅代理](https://www.ipwo.net/?ref=githubgptautoregister) 覆盖 195+ 个国家和地区，支持 HTTP(S) / SOCKS5 协议及灵活的代理配置，为自动化开发与合规网络测试提供多地区网络连接选择。提供动态住宅代理、静态住宅代理、不限量住宅代理等方案，[注册可以领2GB动态代理无门槛免费测试](https://www.ipwo.net/?ref=githubgptautoregister)。90折扣码：`0200` |
+
 
 
 ## 文件清单
