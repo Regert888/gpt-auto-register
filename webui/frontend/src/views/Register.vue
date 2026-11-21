@@ -40,6 +40,7 @@ async function run() {
       want_session_token: true,
       want_refresh_token: true,
       want_2fa: form.value.want2fa,
+      want_password: form.value.wantPassword,
     })
     runtime.addLog(`[client] 启动注册 run_id=${r.run_id} email=${r.email}`, 'evt')
     runtime.streamRun(r.run_id)
@@ -88,16 +89,24 @@ async function copyField(email, field) {
             <el-form-item label="OTP 等待秒数">
               <el-input-number v-model="form.otpTimeout" :min="10" :max="600" />
             </el-form-item>
-            <el-form-item>
-              <div style="display: flex; align-items: center; gap: 10px">
+            <el-form-item label="密码 / 2FA">
+              <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
+                <el-switch v-model="form.wantPassword" />
+                <span>注册时设置密码</span>
+              </div>
+              <div class="hint" style="margin-top: 6px; line-height: 1.5">
+                默认关。不设密码时走 <b>passwordless 注册</b>（邮箱 OTP 验证），
+                账号以后只能靠邮箱收码登录 —— 临时邮箱域名失效后可能无法找回。
+              </div>
+              <div style="display: flex; align-items: center; gap: 10px; margin-top: 12px">
                 <el-switch v-model="form.want2fa" />
                 <span>注册成功后自动绑定 2FA（TOTP）</span>
               </div>
               <div class="hint" style="margin-top: 6px; line-height: 1.5">
-                默认开。绑定不可逆、即刻生效：<b>之后该号所有登录都需 6 位动态码</b>；
+                默认关。绑定不可逆、即刻生效：<b>之后该号所有登录都需 6 位动态码</b>；
                 secret 仅在绑定时下发<b>一次</b>、服务端取不回，
                 请在下方结果或「注册结果」页<b>立刻复制导出</b>并录入验证器，丢失 = 该号 2FA 永久锁死。
-                仅对<b>有密码</b>的号生效，无密码号会自动跳过。
+                无密码号仍可通过 access_token 快路径绑定；需要密码重登的慢路径会自动跳过。
               </div>
             </el-form-item>
             <el-button type="primary" :loading="starting || runningSingle" @click="run">

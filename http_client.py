@@ -133,6 +133,17 @@ def create_http_session(
     创建 HTTP 会话。优先使用 curl_cffi 模拟浏览器 TLS 指纹，
     不可用时降级到 requests。
     """
+    # 某些 impersonate 在 curl_cffi 的枚举里有、但当前 libcurl 实际不支持，
+    # 直到第一次请求才抛 ImpersonateError（实测 safari18_4_ios）。这里兜底换同族
+    # 的可用版本，避免整轮注册白跑。
+    _IMPERSONATE_FALLBACKS = {
+        "safari18_4_ios": "safari18_0_ios",
+    }
+    if impersonate in _IMPERSONATE_FALLBACKS:
+        fallback = _IMPERSONATE_FALLBACKS[impersonate]
+        logger.warning(f"impersonate={impersonate} 当前 libcurl 不支持，回退到 {fallback}")
+        impersonate = fallback
+
     if _HAS_CFFI:
         session = CffiSession(impersonate=impersonate)
         # 使用显式配置，避免被系统 HTTP(S)_PROXY 隐式污染。

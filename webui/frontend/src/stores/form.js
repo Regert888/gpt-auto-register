@@ -1,7 +1,9 @@
 import { defineStore } from 'pinia'
 import { reactive, watch } from 'vue'
 
-const KEY = 'gpt_outlook_register_form_v2'
+// v3: 密码 / 2FA 默认值改为关闭。旧 key 里记着 want2fa=true，加载时会覆盖
+// 新默认值，所以升版本一次性丢弃旧记忆（代理等回到默认，需要重填一次）。
+const KEY = 'gpt_outlook_register_form_v3'
 
 // 跨页面共享 + localStorage 持久化的表单字段
 // （proxy 在 注册 / 自动跑号 / Plus 检测 三处共用）
@@ -11,12 +13,13 @@ const defaults = {
   autoConcurrency: 1,
   autoCoolDown: 3,
   autoTargetCount: 0,
-  // 注册后自动绑 2FA。单次 / 批量都**默认 true**：每个号都要 2FA。
-  // 仍然拆成两个字段（而不是共用一个）：单次页是验 bug / 试流程的测试台，
-  // 共用的话在那边临时关掉，回头批量跑几百个号就全裸奔了。
-  // localStorage 只记住主人上次的选择，不改变默认值：清缓存后两边都回到 true。
-  want2fa: true,
-  autoWant2fa: true,
+  // 密码 / 2FA 都**默认关闭**（2026-11 主人要求）。
+  // 仍然拆成单次/批量两组：单次页是试验台，批量页动辄几百个号，
+  // 两边临时改动互不影响。localStorage 只记住上次选择，不改变默认值。
+  wantPassword: false,
+  autoWantPassword: false,
+  want2fa: false,
+  autoWant2fa: false,
 }
 
 // el-select 的 clearable 清空时把值写成 **undefined**（不是 ''），而 proxy 在三个

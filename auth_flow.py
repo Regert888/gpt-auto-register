@@ -50,6 +50,14 @@ def _totp_now(secret_b32: str) -> str:
     return _hotp(secret_b32, int(time.time()) // 30)
 
 
+class CloudflareChallengeError(RuntimeError):
+    """authorize 出口被 Cloudflare 人机挑战（HTTP 403 Just a moment）。
+
+    单靠同一 session 重试没用（代理的出口粘在同一个 IP 上），
+    调用方应新建 session / 重新 warmup 换出口后再试。
+    """
+
+
 class AuthResult:
     """认证结果"""
 
@@ -150,15 +158,40 @@ class AuthFlow:
         self._oauth_scope = ""
         self._oauth_state = ""
         self._oauth_auth_url = ""
+        # 2026-09 抓包新增：authorize 落地 URL 是“新号/已有号”的唯一可靠判据
+        # （真机已不调用 authorize/continue）；document-navigation-id 是 auth JSON
+        # POST 的一次性风控头，整页文档导航换一个、SPA 内部路由不换。
+        self._authorize_landing_url = ""
+        self._document_navigation_id = ""
+        self._auth_session_logging_id = ""
+        self._CC_CAPS = "login_methods chatgpt_login_finalizer_v1"
+        self._AUTH_RETURN_TARGET_CATEGORY = "chatgpt_home"
         self._client_auth_session_dump: dict[str, Any] = {}
         self._client_auth_session_id: str = ""
         self._dump_login_verifier: str = ""
         self._codex_rt_attempted: bool = False
+        # 落地 URL 分类命中时不会提前算 authorize_continue 的 sentinel，
+        # 这些字段可能从未赋值；统一给空串，后续发码/建号逻辑直接读也不炸。
+        self._last_sentinel_token: str = ""
+        self._last_sentinel_so_token: str = ""
         self._trace_dump_enabled = str(os.getenv("AUTH_TRACE_DUMP", "0")).lower() in ("1", "true", "yes", "on")
         self._trace_include_cookie = str(os.getenv("AUTH_TRACE_INCLUDE_COOKIE", "0")).lower() in (
             "1", "true", "yes", "on"
         )
         self._trace_dump_path = ""
+        # 抓包文件初始化：原先这段被误放进 _build_chatgpt_cookie_header 的 return
+        # 之后（死代码），AUTH_TRACE_DUMP=1 从来没有真正落过盘。
+        if self._trace_dump_enabled:
+            try:
+                os.makedirs("outputs", exist_ok=True)
+                ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                self._trace_dump_path = os.path.join(
+                    "outputs", f"auth_trace_{ts}_{os.getpid()}.jsonl"
+                )
+                logger.info(f"HTTP 明文抓包已启用: {self._trace_dump_path}")
+            except Exception as e:
+                logger.warning(f"初始化 HTTP 抓包文件失败: {e}")
+                self._trace_dump_enabled = False
         logger.info(
             f"指纹: type={self._fingerprint['browser_type']} "
             f"impersonate={self._fingerprint['impersonate']} "
@@ -243,15 +276,6 @@ class AuthFlow:
                 cookie_pairs.append((name, value))
 
         return "; ".join(f"{name}={value}" for name, value in cookie_pairs if name and value)
-        if self._trace_dump_enabled:
-            try:
-                os.makedirs("outputs", exist_ok=True)
-                ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-                self._trace_dump_path = os.path.join("outputs", f"auth_trace_{ts}_{os.getpid()}.jsonl")
-                logger.info(f"HTTP 明文抓包已启用: {self._trace_dump_path}")
-            except Exception as e:
-                logger.warning(f"初始化 HTTP 抓包文件失败: {e}")
-                self._trace_dump_enabled = False
 
     def _trace_http(self, step: str, resp, extra_request: dict | None = None):
         """可选 HTTP 细粒度追踪（用于协议调试）"""
@@ -617,6 +641,34 @@ class AuthFlow:
         # 原本是 @staticmethod，为了读 self._env_overrides 改成实例方法。
         # 调用点全是 self._env_flag(...)，签名不变。
         return self._get_env(name, default).lower() in ("1", "true", "yes", "on")
+
+    def _should_set_password(self) -> bool:
+        """本次注册是否设置密码（POST user/register）。
+
+        默认**关闭**：不设密码时服务端走 passwordless 注册（邮箱 OTP），
+        与 want_2fa 一样由调用方（WebUI 开关 / CLI 环境变量）显式开启。
+        CLI 老用户想保持旧行为：设 REGISTER_SET_PASSWORD=1。
+        """
+        return self._env_flag("REGISTER_SET_PASSWORD", "0")
+
+    def _warm_create_account_password_page(self) -> None:
+        """无密码注册前先 GET create-account/password 建立服务端状态。
+
+        register_password() 里也有这一步（HAR 确认需要）。跳过设密码时没人访问它，
+        直接 passwordless/send-otp 容易 409 invalid_state，所以单独补一次。
+        失败不阻断：真不行后面 kickoff_otp_delivery 还有 send_otp 兜底。
+        """
+        try:
+            resp = self.session.get(
+                "https://auth.openai.com/create-account/password",
+                headers=self._common_headers("https://auth.openai.com/create-account"),
+                timeout=15,
+            )
+            logger.debug("create-account/password 预访问: %s", resp.status_code)
+        except Exception as e:
+            logger.warning(f"create-account/password 预访问失败: {e}")
+        # 整页文档导航 → 换一个 document-navigation-id
+        self._new_document_navigation()
 
     @staticmethod
     def _b64url_no_pad(raw: bytes) -> str:
@@ -1042,6 +1094,17 @@ class AuthFlow:
             time.sleep(4)
         raise TimeoutError(f"等待手机 OTP 超时 ({timeout}s)")
 
+    def _has_phone_verification(self) -> bool:
+        """当前是否具备 add-phone 验证能力（SMS 接码 controller 或环境变量号码）。
+
+        Codex RT 对正常新号仍强制 add-phone（2026-11 实测抓包：session/select
+        返回 continue_url=/add-phone，去掉 prompt 重授权也一样），只有极少数号
+        会直接过。所以没有接码能力时不要空转重试，直接告警返回。
+        """
+        if self._sms_callback is not None:
+            return True
+        return bool((os.getenv("OPENAI_PHONE_NUMBER", "") or "").strip())
+
     def _handle_add_phone_verification(self, continue_url: str = "") -> str:
         """
         处理 add-phone 验证分支：
@@ -1334,6 +1397,13 @@ class AuthFlow:
         - 使用独立 Codex OAuth 参数重新授权（可控 PKCE）
         - 捕获 callback code（不消费）
         - 直接调 /oauth/token 交换 access_token + refresh_token
+
+        ⚠️ 2026-11 实测抓包：Codex RT 对正常新号**强制 add-phone**
+        （choose-an-account → session/select 返回 continue_url=/add-phone，
+        去掉 prompt 重授权也一样；极少数号会直接过）。所以这里默认按接码流程处理：
+        命中 add-phone → SMS/环境变量绑号 → 重新 authorize。
+        没有接码能力时明确告警并快速返回，不再空转重试。
+        （v0.5.8 的“无需接码”是临时 bug，不能作为常规路径。）
         """
         allow_retry = self._env_flag("OAUTH_CODEX_RT_ALLOW_RETRY", "0")
         if self._codex_rt_attempted and (not allow_retry):
@@ -1389,27 +1459,34 @@ class AuthFlow:
                             "codex_post_login",
                         )
 
-            # Codex authorize 直接被打到 /add-phone（不经过 /log-in）：
-            # 如果配了 SMS 接码 controller，先把手机号绑了再重新 authorize
-            if (not callback_url) and self._is_add_phone_state(page_type="", continue_url=final_url or "") \
-                    and self._sms_callback is not None:
-                logger.info("Codex 授权直接落到 /add-phone，尝试 SMS 接码绑号 ...")
-                try:
-                    self._handle_add_phone_via_sms(continue_url=final_url)
-                    # 绑号成功后重新 authorize 拿 callback code
-                    callback_url, final_url = self._follow_authorize_for_callback(
-                        auth_url, redirect_uri, "codex_authorize_after_add_phone"
+            # Codex 授权落到 /add-phone（不论有没有经过 /log-in）：
+            # 正常新号这里就是强制接码，只有极少数号能直接过。
+            # 有接码能力（SMS controller / OPENAI_PHONE_NUMBER）就绑号后重新 authorize；
+            # 没有就明确告警并快速返回，别空转重试浪费一轮。
+            if (not callback_url) and self._is_add_phone_state(page_type="", continue_url=final_url or ""):
+                if self._has_phone_verification():
+                    logger.info("Codex 命中 add-phone，开始手机号验证（SMS/环境变量）...")
+                    try:
+                        self._handle_add_phone_verification(continue_url=final_url)
+                        # 绑号成功后重新 authorize 拿 callback code
+                        callback_url, final_url = self._follow_authorize_for_callback(
+                            auth_url, redirect_uri, "codex_authorize_after_add_phone"
+                        )
+                        if not callback_url:
+                            no_prompt_url = self._drop_query_keys(auth_url, {"prompt"})
+                            if no_prompt_url and no_prompt_url != auth_url:
+                                callback_url, final_url = self._follow_authorize_for_callback(
+                                    no_prompt_url,
+                                    redirect_uri,
+                                    "codex_authorize_noprompt_after_add_phone",
+                                )
+                    except Exception as e:
+                        logger.warning(f"接码绑号失败: {e}")
+                else:
+                    logger.warning(
+                        "Codex 命中 add-phone，但未配置 SMS 接码 / OPENAI_PHONE_NUMBER —— "
+                        "本号无法获取 refresh_token；请在 WebUI「接码配置」启用接码后重试"
                     )
-                    if not callback_url:
-                        no_prompt_url = self._drop_query_keys(auth_url, {"prompt"})
-                        if no_prompt_url and no_prompt_url != auth_url:
-                            callback_url, final_url = self._follow_authorize_for_callback(
-                                no_prompt_url,
-                                redirect_uri,
-                                "codex_authorize_noprompt_after_add_phone",
-                            )
-                except Exception as e:
-                    logger.warning(f"SMS 接码绑号失败: {e}")
 
             # 兜底：去掉 prompt=login 再发起一次授权
             if not callback_url:
@@ -1422,7 +1499,13 @@ class AuthFlow:
                     )
 
             if not callback_url:
-                logger.debug("Codex OAuth 未捕获 callback code, final=%s", (final_url or "")[:180])
+                if self._is_add_phone_state(page_type="", continue_url=final_url or ""):
+                    logger.warning(
+                        "Codex OAuth 仍被 add-phone 拦截，未能获取 refresh_token"
+                        "（手机号验证未通过 / 号码被拒 / 未配置接码）"
+                    )
+                else:
+                    logger.debug("Codex OAuth 未捕获 callback code, final=%s", (final_url or "")[:180])
                 return False
             return self._exchange_codex_callback_code(
                 callback_url=callback_url,
@@ -1569,29 +1652,32 @@ class AuthFlow:
 
     @staticmethod
     def _datadog_trace_headers() -> dict:
-        """生成 Datadog RUM 追踪头（对齐 gptfree-register 格式）。"""
+        """生成 Datadog RUM 追踪头（2026-09-21 抓包校正）。
+
+        真机三处 auth JSON POST 都带 traceparent + **tracestate** + RUM 头；
+        旧实现没有 tracestate，反而多发 x-datadog-tags（真机没有）。
+        """
         tid = f"{random.getrandbits(64):016x}"
         sid = str(random.getrandbits(63))
         pid = str(random.getrandbits(63))
-        ts_hex = f"{int(time.time()):08x}"
         return {
             "traceparent": f"00-0000000000000000{tid}-{random.getrandbits(64):016x}-01",
+            "tracestate": "dd=s:1;o=rum",
             "x-datadog-trace-id": sid,
             "x-datadog-parent-id": pid,
             "x-datadog-sampling-priority": "1",
             "x-datadog-origin": "rum",
-            "x-datadog-tags": f"_dd.p.id={tid},_dd.p.tid={ts_hex}00000000,_dd.b.sr=1",
         }
 
-    def _common_headers(self, referer: str = "https://chatgpt.com/") -> dict:
+    def _common_headers(self, referer: str = "https://chatgpt.com/", target_url: str = "") -> dict:
         """
         构造通用请求头。
 
-        关键点：
-        - Origin 必须与 Referer 同源（尤其 auth.openai.com 的状态机接口），
-          否则容易触发 invalid_state / 风控分支。
-        - 在 auth.openai.com 域下，尽量补充 oai-device-id，提升状态机连续性。
-        - 全请求注入 Datadog trace 头，避免 OTP silent-drop。
+        2026-09-21 抓包校正：
+        - auth.openai.com/api/accounts/* **从不带** oai-device-id；
+          该头只随 chatgpt.com 的 backend-api / backend-anon 下发。
+          旧实现按“域”判断，给所有 auth 请求都加了，属于可测指纹。
+        - 全请求注入 Datadog trace 头（含 tracestate）。
         """
         origin = "https://chatgpt.com"
         try:
@@ -1630,17 +1716,55 @@ class AuthFlow:
             if fp.get("sec_ch_ua_platform_version"):
                 headers["sec-ch-ua-platform-version"] = fp["sec_ch_ua_platform_version"]
 
-        # auth.openai.com 侧请求补设备标识（若可得）
-        try:
-            host = (urlparse(origin).netloc or "").lower()
-        except Exception:
-            host = ""
-        if "auth.openai.com" in host:
-            device_id = (self.result.device_id or "").strip() or (self.session.cookies.get("oai-did", "") or "").strip()
+        # oai-device-id 只在 chatgpt.com 的 backend-api / backend-anon 上下发
+        if self._should_send_oai_device_id(target_url):
+            device_id = (self.result.device_id or "").strip() or (
+                self.session.cookies.get("oai-did", "") or ""
+            ).strip()
             if device_id:
                 headers["oai-device-id"] = device_id
 
         headers.update(self._datadog_trace_headers())
+        return headers
+
+    @staticmethod
+    def _should_send_oai_device_id(target_url: str) -> bool:
+        """oai-device-id 只随 chatgpt.com 的 backend-api / backend-anon 下发。
+
+        抓包事实：整条注册链上 auth.openai.com/api/accounts/* 一次都没有这个头；
+        判据是**目标 URL**，不是 Referer、也不是“是不是 auth 域”。
+        """
+        try:
+            parsed = urlparse(target_url or "")
+        except Exception:
+            return False
+        host = (parsed.netloc or "").lower()
+        path = (parsed.path or "").lower()
+        is_chatgpt = host == "chatgpt.com" or host.endswith(".chatgpt.com")
+        return is_chatgpt and (
+            path.startswith("/backend-api/") or path.startswith("/backend-anon/")
+        )
+
+    def _new_document_navigation(self) -> str:
+        """铸一个新的 document-navigation-id（每次整页文档导航时调用）。
+
+        该头只随 auth JSON POST 下发；同一文档内的多个 POST 共用，
+        /email-verification → /about-you 这种 SPA 内部路由切换不换。
+        """
+        self._document_navigation_id = str(uuid.uuid4())
+        return self._document_navigation_id
+
+    def _auth_json_headers(self, referer: str, target_url: str = "") -> dict:
+        """auth.openai.com 侧 JSON POST 的头（含 2026-09 抓包新增的两个一次性头）。
+
+        - x-openai-document-navigation-id：整页文档导航换一个，同文档多个 POST 共用
+        - x-access-flow-invocation-id：每次调用一个新 uuid4
+        """
+        headers = self._common_headers(referer, target_url=target_url)
+        headers["Content-Type"] = "application/json"
+        headers["x-access-flow-invocation-id"] = str(uuid.uuid4())
+        if self._document_navigation_id:
+            headers["x-openai-document-navigation-id"] = self._document_navigation_id
         return headers
 
     def _navigation_headers(self) -> dict:
@@ -1681,6 +1805,26 @@ class AuthFlow:
                 if fp.get(key):
                     headers[name] = fp[key]
         return headers
+
+    def _reset_session_for_retry(self) -> None:
+        """换出口重试：新建 session（代理按连接分配新 IP），并清掉旧会话状态。
+
+        调用方需重新 warmup + 取 csrf + 重新 signin/authorize，因为 oai-did
+        和 authorize state 都跟着旧 session 走。
+        """
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        self.session = create_http_session(
+            proxy=self.config.proxy,
+            impersonate=self._impersonate_candidates[self._impersonate_idx],
+            user_agent=self._ua,
+        )
+        self.result.device_id = ""
+        self._authorize_landing_url = ""
+        self._document_navigation_id = ""
+        self._auth_session_logging_id = ""
 
     def warmup(self) -> bool:
         """GET chatgpt.com 种全套 cookie（含 oai-did），成功返回 True。
@@ -1729,11 +1873,19 @@ class AuthFlow:
         """
         headers = self._navigation_headers()
 
-        for attempt in range(4):
+        # 单次 warmup 实测成功率约 24%（参考项目 30 个出口的统计），所以多试几个
+        # 出口是唯一可靠手段；403 只是出口被 CF 挑战，不需要长退避，快速换 session
+        # （新连接 = 新出口）即可。可用 WARMUP_ATTEMPTS 覆盖。
+        try:
+            warmup_attempts = max(1, int(self._get_env("WARMUP_ATTEMPTS", "8")))
+        except Exception:
+            warmup_attempts = 8
+        last_status = None
+        for attempt in range(warmup_attempts):
             if attempt:
                 # 只换出口 IP（新 session = 新出口），指纹保持不变：
-                # 403 是缺 client hints 导致的，已在头里修好，不是指纹的锅。
-                time.sleep(3 + attempt * 2)
+                # 403 是出口 IP 被挑战，不是缺 client hints（头已补齐）。
+                time.sleep(1.2 if last_status == 403 else min(3 + attempt * 2, 10))
                 self.session = create_http_session(
                     proxy=self.config.proxy,
                     impersonate=self._impersonate_candidates[self._impersonate_idx],
@@ -1744,9 +1896,11 @@ class AuthFlow:
                     "https://chatgpt.com", headers=headers, timeout=40,
                 )
                 status = resp.status_code
+                last_status = status
             except Exception as e:
                 status = None
-                logger.warning(f"warmup 第 {attempt + 1}/4 次请求失败: {e}")
+                last_status = None
+                logger.warning(f"warmup 第 {attempt + 1}/{warmup_attempts} 次请求失败: {e}")
 
             # 唯一判据：cookie 到底种上没有。HTTP 200 不代表拿到 oai-did（CF 403 只给
             # __cf_bm），请求抛异常也不代表没拿到（超时前可能已经种上了）。
@@ -1762,12 +1916,15 @@ class AuthFlow:
                 return True
 
             logger.warning(
-                f"warmup 第 {attempt + 1}/4 次未种到 oai-did"
+                f"warmup 第 {attempt + 1}/{warmup_attempts} 次未种到 oai-did"
                 + (f"（HTTP {status}）" if status is not None else "")
                 + (f"，已有 cookie: {sorted(cookies)}" if cookies else "，无任何 cookie")
             )
 
-        logger.error("warmup 4 次均未种到 oai-did cookie —— 此时继续走注册链必然 409 invalid_state")
+        logger.error(
+            f"warmup {warmup_attempts} 次均未种到 oai-did cookie —— "
+            "此时继续走注册链必然 409 invalid_state"
+        )
         return False
 
     # ── Step 1: 检查代理连通性 ──
@@ -1856,18 +2013,71 @@ class AuthFlow:
         return csrf
 
     # ── Step 3: 获取 auth URL ──
+    def _resolve_device_id(self) -> str:
+        """取本次会话的 oai-did：优先 result，其次 warmup 种下的 cookie，最后才 uuid4。
+
+        2026-09-21 抓包定位：signin 的 ext-oai-did 必须是 warmup 种下的同一个值，
+        服务端才能把这次 authorize 关联到该会话；用凭空 uuid4 会走成
+        “authorize 不跳 /email-verification → authorize/continue 409 → OTP 静默丢码”。
+        """
+        device_id = str(getattr(self.result, "device_id", "") or "").strip()
+        if not device_id:
+            try:
+                device_id = str(self.session.cookies.get("oai-did", "") or "").strip()
+            except Exception:
+                device_id = ""
+        if not device_id:
+            device_id = str(uuid.uuid4())
+            logger.warning("oai-did 未在 cookie 中找到，临时生成 —— 服务端可能不认这个会话")
+        self.result.device_id = device_id
+        return device_id
+
+    def _ensure_authorize_context(self, authorize_url: str, email: str = "") -> str:
+        """补齐 authorize URL 上缺失的上下文参数（只补缺失，不覆盖服务端值）。"""
+        try:
+            parsed = urlparse(authorize_url or "")
+            if "auth.openai.com" not in (parsed.netloc or "").lower():
+                return authorize_url
+            params = parse_qs(parsed.query, keep_blank_values=True)
+            required = {
+                "ext-oai-did": self.result.device_id,
+                "auth_session_logging_id": self._auth_session_logging_id,
+                "screen_hint": "login_or_signup",
+                "ccaps": self._CC_CAPS,
+                "auth_return_target_category": self._AUTH_RETURN_TARGET_CATEGORY,
+            }
+            if email:
+                required["login_hint"] = email
+            changed = False
+            for key, value in required.items():
+                if not value:
+                    continue
+                if not params.get(key):
+                    params[key] = [value]
+                    changed = True
+            if not changed:
+                return authorize_url
+            logger.debug("authorize URL 缺上下文参数，已兜底补齐")
+            return parsed._replace(query=urlencode(params, doseq=True)).geturl()
+        except Exception as e:
+            logger.debug(f"authorize 上下文兜底跳过: {e}")
+            return authorize_url
+
     def get_auth_url(self, csrf_token: str, email: str = "") -> str:
         logger.info("[2/10] 获取 OpenAI 授权地址...")
         headers = self._common_headers("https://chatgpt.com/auth/login")
         headers["Content-Type"] = "application/x-www-form-urlencoded"
-        if not self.result.device_id:
-            self.result.device_id = str(uuid.uuid4())
+        # 真机同源 signin 不带 Origin（抓包逐字对照）
+        headers.pop("Origin", None)
+        # ⚠️ 必须复用 warmup 种下的 oai-did，不能 uuid4
+        did = self._resolve_device_id()
+        if not self._auth_session_logging_id:
+            self._auth_session_logging_id = str(uuid.uuid4())
         query_params: dict[str, str] = {
             "prompt": "login",
+            "ext-oai-did": did,
+            "auth_session_logging_id": self._auth_session_logging_id,
             "screen_hint": "login_or_signup",
-            "ext-oai-did": self.result.device_id,
-            "auth_session_logging_id": str(uuid.uuid4()),
-            "ext-passkey-client-capabilities": "1111",
         }
         if email:
             query_params["login_hint"] = email
@@ -1876,8 +2086,9 @@ class AuthFlow:
             signin_url,
             headers=headers,
             data={
+                # 真机抓包 callbackUrl 是相对路径 "/"
                 "csrfToken": csrf_token,
-                "callbackUrl": "https://chatgpt.com/",
+                "callbackUrl": "/",
                 "json": "true",
             },
             timeout=30,
@@ -1887,6 +2098,7 @@ class AuthFlow:
         auth_url = resp.json().get("url", "")
         if not auth_url:
             raise RuntimeError("Auth URL 获取失败")
+        auth_url = self._ensure_authorize_context(auth_url, email)
         # 记住 OAuth 参数，并根据开关可选注入 PKCE
         self._remember_oauth_params(auth_url)
         auth_url = self._inject_pkce_into_auth_url(auth_url)
@@ -1895,6 +2107,25 @@ class AuthFlow:
         return auth_url
 
     # ── Step 4: OAuth 初始化 & 获取 device_id ──
+    @staticmethod
+    def _is_cf_challenge(resp) -> bool:
+        """判断响应是不是 Cloudflare 人机挑战（不是普通 403 业务错误）。"""
+        try:
+            if int(getattr(resp, "status_code", 0) or 0) != 403:
+                return False
+            headers = getattr(resp, "headers", {}) or {}
+            if str(headers.get("cf-mitigated") or "").lower() == "challenge":
+                return True
+            body = (getattr(resp, "text", "") or "")[:6000].lower()
+            return (
+                "just a moment" in body
+                or "cf-challenge" in body
+                or "challenge-platform" in body
+                or "cf_chl_opt" in body
+            )
+        except Exception:
+            return False
+
     def auth_oauth_init(self, auth_url: str) -> str:
         """跟随 authorize 链，落 authorize 会话状态并取回 oai-did。
 
@@ -1919,8 +2150,30 @@ class AuthFlow:
         headers["sec-fetch-site"] = "cross-site"
         # 302 自动跟随不是用户手动点击，真浏览器此时不发 sec-fetch-user
         headers.pop("sec-fetch-user", None)
+        # authorize 出口被 Cloudflare 挑战时（403 Just a moment），继续走只会
+        # 落到 authorize/continue 409，白烧一次邮箱。同一 session 重试换不掉出口
+        # （代理按连接粘 IP），所以抛专用异常，由 run_register 重建 session + 重新
+        # warmup/signin 换一个出口。
         resp = self.session.get(auth_url, headers=headers, timeout=30, allow_redirects=True)
         self._trace_http("auth_oauth_init", resp)
+        if self._is_cf_challenge(resp):
+            raise CloudflareChallengeError(
+                "authorize 出口被 Cloudflare 挑战（HTTP 403 Just a moment），"
+                "当前代理/IP 不可用"
+            )
+
+        # authorize 落地 URL：真机已不调 authorize/continue，新号/已有号的判据
+        # 迁到这里（/email-verification = 新号，/log-in = 已有号）。整页文档导航，
+        # 顺带铸一个新的 document-navigation-id。
+        self._new_document_navigation()
+        try:
+            self._authorize_landing_url = str(getattr(resp, "url", "") or "").strip()
+        except Exception:
+            self._authorize_landing_url = ""
+        if self._authorize_landing_url:
+            logger.info(f"authorize 落地: {self._authorize_landing_url[:160]}")
+        else:
+            logger.warning("authorize 落地 URL 未取到，signup 将回退 authorize/continue 探测")
 
         # 从 cookie 获取 oai-did
         device_id = ""
@@ -2011,8 +2264,10 @@ class AuthFlow:
         trace_step: str = "",
     ) -> dict:
         """调用 /api/accounts/authorize/continue，返回 JSON。"""
-        headers = self._common_headers(referer)
-        headers["Content-Type"] = "application/json"
+        headers = self._auth_json_headers(
+            referer,
+            target_url="https://auth.openai.com/api/accounts/authorize/continue",
+        )
         if sentinel_token:
             headers["openai-sentinel-token"] = sentinel_token
         if getattr(self, "_last_sentinel_so_token", ""):
@@ -2046,16 +2301,104 @@ class AuthFlow:
         except Exception:
             return {}
 
-    def signup(self, email: str, sentinel_token: str) -> bool:
-        """提交注册邮箱。返回 True 表示走新注册流程，False 表示已有账号走 OTP 登录流程"""
-        logger.info("[5/10] 提交注册邮箱...")
-        data = self.authorize_continue(
-            email=email,
-            sentinel_token=sentinel_token,
-            screen_hint="signup",
-            referer="https://auth.openai.com/create-account",
-            trace_step="authorize_continue_signup",
-        )
+    @staticmethod
+    def _classify_authorize_landing(landing_url: str, intent: str = "signup") -> str:
+        """把 authorize 落地 URL 映射成状态：new / new_otp / existing / ""（判不出）。
+
+        真机 2026-09-21 抓包：邮箱由 signin 的 login_hint 透传进 authorize，
+        authorize 这一跳直接送达邮箱并落 /email-verification，
+        **POST /api/accounts/authorize/continue 0 次调用**。
+        同一个 /email-verification 在注册链路是“新号”，在登录链路是“已有号”，
+        所以必须按 intent 分流。
+        """
+        u = (landing_url or "").strip().lower()
+        if not u:
+            return ""
+        if "/create-account" in u or "/about-you" in u:
+            return "new"
+        if "/log-in" in u:
+            return "existing"
+        if "/email-verification" in u:
+            if (intent or "signup").lower() == "signup":
+                return "new_otp"   # 服务端已自动发过 OTP，只能 resend
+            return "existing"
+        return ""
+
+    def _apply_signup_verdict(self, verdict: str, page_type: str = "") -> bool:
+        """把落地 URL 判定写进实例状态并返回 is_new。"""
+        if verdict == "new":
+            self._is_existing_account = False
+            self._existing_email_verification_mode = ""
+            self._existing_page_type = page_type or "create_account_password"
+            return True
+        if verdict == "new_otp":
+            # 新号，但服务端在 authorize 阶段已经发过 OTP —— 标记成
+            # passwordless_signup，让后续发码只走 resend，不新建 challenge。
+            self._is_existing_account = False
+            self._existing_email_verification_mode = "passwordless_signup"
+            self._existing_page_type = page_type or "email_otp_verification"
+            return True
+        self._is_existing_account = True
+        self._existing_email_verification_mode = ""
+        self._existing_page_type = page_type or "email_otp_verification"
+        return False
+
+    def signup(self, email: str, sentinel_token: str = "", landing_url: str = "",
+               intent: str = "signup", sentinel_provider=None) -> bool:
+        """判定本次会话走“新注册”还是“已有账号 OTP 登录”。True = 新注册。
+
+        2026-09 抓包重构：真机不调 authorize/continue，邮箱靠 signin 的
+        login_hint 透传进 authorize 并直接落 /email-verification。
+        所以优先用 authorize 落地 URL 分类，**不发任何 POST**；
+        落地 URL 判不出时才回退旧的 authorize/continue 探测（探测失败也不再
+        直接打死整轮，按落地 URL 或保守“新注册”兜底）。
+        """
+        landing = (landing_url or "").strip()
+        if landing:
+            verdict = self._classify_authorize_landing(landing, intent=intent)
+            if verdict:
+                is_new = self._apply_signup_verdict(verdict)
+                logger.info(
+                    "注册状态判定: %s（authorize 落地=%s，未发 authorize/continue POST）",
+                    "新账号" if is_new else "已有账号", landing[:120],
+                )
+                return is_new
+            logger.warning(
+                "authorize 落地 URL 无法判定（%s），回退 authorize/continue 探测", landing[:120]
+            )
+
+        logger.info("[5/10] 提交注册邮箱（authorize/continue 兜底探测）...")
+        # 只有走到兜底探测才真的需要 authorize_continue 的 sentinel（~20s PoW）。
+        # 落地 URL 能判出状态时完全不用算，单号省一次 PoW。
+        if not sentinel_token and sentinel_provider is not None:
+            try:
+                sentinel_token = sentinel_provider() or ""
+            except Exception as e:
+                logger.warning(f"懒取 authorize_continue sentinel 失败，按空 token 探测: {e}")
+        try:
+            data = self.authorize_continue(
+                email=email,
+                sentinel_token=sentinel_token,
+                screen_hint="signup",
+                referer="https://auth.openai.com/create-account",
+                trace_step="authorize_continue_signup",
+            )
+        except Exception as e:
+            fallback = self._classify_authorize_landing(
+                landing or getattr(self, "_authorize_landing_url", ""), intent=intent
+            )
+            if fallback:
+                is_new = self._apply_signup_verdict(fallback)
+                logger.warning(
+                    "authorize/continue 探测失败（%s），改用落地 URL 判定: %s",
+                    e, "新账号" if is_new else "已有账号",
+                )
+                return is_new
+            logger.warning(f"authorize/continue 探测失败且无落地 URL 可判（{e}），保守按新注册处理")
+            self._is_existing_account = False
+            self._existing_email_verification_mode = ""
+            self._existing_page_type = ""
+            return True
 
         # 检测 page_type/continue_url，区分新账号与已有账号
         try:
@@ -2119,6 +2462,9 @@ class AuthFlow:
             logger.info(f"create-account/password 页面: {pw_page.status_code}")
         except Exception as e:
             logger.warning(f"访问 create-account/password 页面失败: {e}")
+        # 这次整页文档导航对应一个新的 document-navigation-id（抓包里
+        # user/register 的头与后续 email-otp/validate 不同值）。
+        self._new_document_navigation()
 
         # 注册前需要刷新 sentinel token，且 flow 必须为 username_password_create
         #
@@ -2150,8 +2496,10 @@ class AuthFlow:
                     f"注册前刷新 sentinel 失败，将改用 flow 不匹配的现有 sentinel token 提交: {e}"
                 )
 
-        headers = self._common_headers("https://auth.openai.com/create-account/password")
-        headers["Content-Type"] = "application/json"
+        headers = self._auth_json_headers(
+            "https://auth.openai.com/create-account/password",
+            target_url="https://auth.openai.com/api/accounts/user/register",
+        )
         if self._last_sentinel_token:
             headers["openai-sentinel-token"] = self._last_sentinel_token
         # 服务端对该 flow 没下发 so 块时 so_token_for_request 为空 → 不带这个头，
@@ -2206,8 +2554,10 @@ class AuthFlow:
         """
         走 passwordless 发码（create-account/password 页面可触发该路径）。
         """
-        headers = self._common_headers(referer)
-        headers["Content-Type"] = "application/json"
+        headers = self._auth_json_headers(
+            referer,
+            target_url="https://auth.openai.com/api/accounts/passwordless/send-otp",
+        )
         if self._last_sentinel_token:
             headers["openai-sentinel-token"] = self._last_sentinel_token
         if getattr(self, "_last_sentinel_so_token", ""):
@@ -2229,8 +2579,10 @@ class AuthFlow:
         重发 OTP（适用于已有账号 passwordless/login_challenge）。
         返回 True 代表请求成功。
         """
-        headers = self._common_headers(referer)
-        headers["Content-Type"] = "application/json"
+        headers = self._auth_json_headers(
+            referer,
+            target_url="https://auth.openai.com/api/accounts/email-otp/resend",
+        )
         if self._last_sentinel_token:
             headers["openai-sentinel-token"] = self._last_sentinel_token
         if getattr(self, "_last_sentinel_so_token", ""):
@@ -2414,8 +2766,43 @@ class AuthFlow:
     # ── Step 8: 验证 OTP ──
     def verify_otp(self, otp_code: str) -> dict:
         logger.info("[7/10] 验证 OTP...")
-        headers = self._common_headers("https://auth.openai.com/email-verification")
-        headers["Content-Type"] = "application/json"
+        headers = self._auth_json_headers(
+            "https://auth.openai.com/email-verification",
+            target_url="https://auth.openai.com/api/accounts/email-otp/validate",
+        )
+        # 2026-09-21 抓包：email-otp/validate 必须带 sentinel，且 flow 是
+        # email_otp_validate（服务端要求 SO token），每个敏感步骤前都要新算一个。
+        # 旧实现这里一个 sentinel 头都不发 —— 这是可测的风控缺口。
+        token_for_request = ""
+        so_token_for_request = ""
+        if self.result.device_id:
+            try:
+                from sentinel import get_sentinel_token as _get_st
+                token_for_request, so_token_for_request = _get_st(
+                    self.session,
+                    device_id=self.result.device_id,
+                    flow="email_otp_validate",
+                    **self._sentinel_fp_kwargs(),
+                )
+                token_for_request = token_for_request or ""
+                so_token_for_request = so_token_for_request or ""
+                if token_for_request:
+                    self._last_sentinel_token = token_for_request
+                if so_token_for_request:
+                    self._last_sentinel_so_token = so_token_for_request
+            except Exception as e:
+                logger.warning(f"OTP 验证前刷新 sentinel 失败: {e}")
+        if not token_for_request:
+            token_for_request = getattr(self, "_last_sentinel_token", "")
+        if token_for_request:
+            headers["openai-sentinel-token"] = token_for_request
+        if so_token_for_request:
+            headers["openai-sentinel-so-token"] = so_token_for_request
+        elif token_for_request:
+            logger.warning(
+                "email-otp/validate 未拿到 SO token（该 flow 服务端要求 so），"
+                "按抓包形态继续发送但不补别的 flow 的 SO token"
+            )
         resp = self.session.post(
             "https://auth.openai.com/api/accounts/email-otp/validate",
             headers=headers,
@@ -2450,8 +2837,10 @@ class AuthFlow:
                 raise
             except Exception as e:
                 logger.warning(f"创建账户前刷新 sentinel 失败: {e}")
-        headers = self._common_headers("https://auth.openai.com/about-you")
-        headers["Content-Type"] = "application/json"
+        headers = self._auth_json_headers(
+            "https://auth.openai.com/about-you",
+            target_url="https://auth.openai.com/api/accounts/create_account",
+        )
         if self._last_sentinel_token:
             headers["openai-sentinel-token"] = self._last_sentinel_token
         if getattr(self, "_last_sentinel_so_token", ""):
@@ -3101,7 +3490,7 @@ class AuthFlow:
         # 必须在 create_mailbox 之前拦掉：邮箱是花钱的，不能为一个注定 409 的轮次浪费。
         if not self.warmup():
             raise RuntimeError(
-                "warmup 失败：4 次重试均未拿到 chatgpt.com 的 oai-did cookie，"
+                "warmup 失败：多次重试均未拿到 chatgpt.com 的 oai-did cookie，"
                 "继续注册必然 409 invalid_state（多为代理出口 IP 不通或被 CF 拦），"
                 "请检查代理后重试"
             )
@@ -3110,12 +3499,47 @@ class AuthFlow:
         email = mail_provider.create_mailbox()
         self.result.email = email
 
-        # 登录/注册链路
-        csrf_token = self.get_csrf_token()
-        auth_url = self.get_auth_url(csrf_token, email=email)
-        device_id = self.auth_oauth_init(auth_url)
-        sentinel = self.get_sentinel_token(device_id)
-        is_new = self.signup(email, sentinel)
+        # 登录/注册链路。
+        # authorize 出口被 Cloudflare 挑战时，同一 session 重试换不掉出口
+        # （代理按连接粘 IP），所以整段重建 session + 重新 warmup/signin。
+        try:
+            auth_rotations = max(1, int(self._get_env("AUTH_IP_ROTATIONS", "5")))
+        except Exception:
+            auth_rotations = 5
+        auth_url = ""
+        device_id = ""
+        for auth_attempt in range(1, auth_rotations + 1):
+            if auth_attempt > 1:
+                logger.warning(
+                    "authorize 出口被 CF 挑战，换出口重试（%s/%s）...",
+                    auth_attempt, auth_rotations,
+                )
+                self._reset_session_for_retry()
+                if not self.warmup():
+                    raise RuntimeError(
+                        "换出口后 warmup 仍失败：新出口也拿不到 oai-did，请检查代理池"
+                    )
+            csrf_token = self.get_csrf_token()
+            auth_url = self.get_auth_url(csrf_token, email=email)
+            try:
+                device_id = self.auth_oauth_init(auth_url)
+                break
+            except CloudflareChallengeError as e:
+                logger.warning(
+                    "authorize 出口被 Cloudflare 挑战（%s/%s）: %s",
+                    auth_attempt, auth_rotations, e,
+                )
+                if auth_attempt >= auth_rotations:
+                    raise
+
+        # 落地 URL 能判定状态时不发 authorize/continue，也就不用提前算 sentinel PoW；
+        # 只有兜底探测才懒取（单号通常省 ~20s）。
+        is_new = self.signup(
+            email,
+            landing_url=self._authorize_landing_url,
+            intent="signup",
+            sentinel_provider=lambda: self.get_sentinel_token(device_id),
+        )
 
         # 号池邮箱被 OpenAI 标"已有账号" 处理策略:
         #   WEBUI_ALLOW_LOGIN=1 (promo-link 等需要拿 access_token 的模式) → 走 OTP login 拿凭证
@@ -3151,12 +3575,21 @@ class AuthFlow:
 
         # ⚠️ passwordless_signup **也是新账号**，只是服务端选择了"不设密码直接发码"的注册流程。
         #    signup() 用一个 bool 表达三种服务端状态，把它和"已有账号"压成了同一个 False，
-        #    结果新号全部走进下面的 else 分支 —— register_password 从没被调用过，
-        #    注册出来的号全是无密码号（只能靠临时邮箱收码登录，域名一失效就永久丢失）。
-        #    实测 2026-08-06: 这类号照样能走 POST user/register 设密码并成功。
+        #    结果新号全部走进下面的 else 分支 —— register_password 从没被调用过。
+        #    现在密码默认**不设**（want_password=false → REGISTER_SET_PASSWORD=0），
+        #    标准新号也要显式走无密码 OTP 路径；开启开关时才 POST user/register 设密码。
         if is_new or self._existing_email_verification_mode == "passwordless_signup":
-            # 新账号：注册密码 → 主动重新发码 → 验证 OTP → 创建账户
-            password_registered = self.register_password(email)
+            set_password = self._should_set_password()
+            # 服务端已选 passwordless 流程时，authorize/continue 已经发过一封 OTP，
+            # 只能 resend 复用同一 challenge；再 send 一次会跳 state → 旧邮件 409。
+            server_sent_otp = (
+                self._existing_email_verification_mode == "passwordless_signup"
+            )
+
+            password_registered = False
+            if set_password:
+                password_registered = self.register_password(email)
+
             if password_registered:
                 # ⚠️ POST user/register 成功后服务端**切换流程**到 email_otp_send 页
                 #    （实测响应 continue_url=/api/accounts/email-otp/send, page.type=email_otp_send），
@@ -3172,12 +3605,26 @@ class AuthFlow:
                     logger.warning(f"密码注册后主动发码失败，回退 resend: {e}")
                     self.kickoff_otp_delivery("post_register_password_send_failed")
             else:
-                logger.warning("注册密码失败，回退到已有账号 OTP 路径")
-                self.fetch_client_auth_session_dump("post_register_password_failed_new")
-                # 密码注册失败时 fallback 主动发码
-                if not self.kickoff_otp_delivery("register_password_failed_fallback"):
-                    self.send_otp()
+                if set_password:
+                    logger.warning("注册密码失败，回退到无密码 OTP 路径")
+                    self.fetch_client_auth_session_dump("post_register_password_failed_new")
+                    # 密码注册失败时 fallback 主动发码（沿用旧行为）
+                    otp_mode = "register_password_failed_fallback"
+                else:
+                    logger.info("已关闭注册密码（want_password=false），走无密码 OTP 注册")
+                    self.fetch_client_auth_session_dump("register_without_password_new")
+                    # passwordless_signup → resend（复用 challenge）；标准新号 → passwordless 发码
+                    otp_mode = "passwordless_signup" if server_sent_otp else "register_no_password"
+                    if not server_sent_otp:
+                        self._warm_create_account_password_page()
+
                 otp_sent_at = time.time()
+                if not self.kickoff_otp_delivery(otp_mode):
+                    if server_sent_otp and not set_password:
+                        # 服务端已有 challenge，send_otp 会把它弄坏；只能放弃本轮
+                        logger.warning("无密码注册：resend 失败且服务端已有 challenge，跳过 send_otp")
+                    else:
+                        self.send_otp()
 
             try:
                 otp_timeout = max(10, int(self._get_env("OTP_TIMEOUT", "60")))
@@ -3196,8 +3643,15 @@ class AuthFlow:
                 if "401" in str(e):
                     logger.warning(f"OTP 首次验证失败，补发重试: {e}")
                     otp_sent_at = time.time()
-                    if not self.kickoff_otp_delivery("verify_otp_retry_new"):
-                        self.send_otp()
+                    # 无密码 + 服务端已发码：只能 resend，不能 send_otp 换 challenge
+                    retry_mode = (
+                        "passwordless_signup"
+                        if (server_sent_otp and not set_password)
+                        else "verify_otp_retry_new"
+                    )
+                    if not self.kickoff_otp_delivery(retry_mode):
+                        if not (server_sent_otp and not set_password):
+                            self.send_otp()
                     otp_code = mail_provider.wait_for_otp(
                         email,
                         timeout=otp_timeout,
@@ -3486,7 +3940,7 @@ class AuthFlow:
         # 这里不花钱建邮箱，但报错说清原因，省得当成"密码错"排查。
         if not self.warmup():
             raise RuntimeError(
-                "warmup 失败：4 次重试均未拿到 chatgpt.com 的 oai-did cookie，"
+                "warmup 失败：多次重试均未拿到 chatgpt.com 的 oai-did cookie，"
                 "继续登录必然 409 invalid_state（多为代理出口 IP 不通或被 CF 拦），"
                 "请检查代理后重试"
             )
@@ -3511,10 +3965,37 @@ class AuthFlow:
             else:
                 logger.info("协议登录：调用方没给密码、库里也没有，用默认规则猜一个试试")
 
-        csrf_token = self.get_csrf_token()
-        auth_url = self.get_auth_url(csrf_token, email=email)
-        device_id = self.auth_oauth_init(auth_url)
-        sentinel = self.get_sentinel_token(device_id)
+        # authorize 出口被 Cloudflare 挑战时，整段重建 session + 重新 warmup/signin。
+        try:
+            auth_rotations = max(1, int(self._get_env("AUTH_IP_ROTATIONS", "5")))
+        except Exception:
+            auth_rotations = 5
+        auth_url = ""
+        device_id = ""
+        sentinel = ""
+        for auth_attempt in range(1, auth_rotations + 1):
+            if auth_attempt > 1:
+                logger.warning(
+                    "authorize 出口被 CF 挑战，换出口重试（%s/%s）...",
+                    auth_attempt, auth_rotations,
+                )
+                self._reset_session_for_retry()
+                if not self.warmup():
+                    raise RuntimeError(
+                        "换出口后 warmup 仍失败：新出口也拿不到 oai-did，请检查代理池"
+                    )
+            csrf_token = self.get_csrf_token()
+            auth_url = self.get_auth_url(csrf_token, email=email)
+            try:
+                device_id = self.auth_oauth_init(auth_url)
+                break
+            except CloudflareChallengeError as e:
+                logger.warning(
+                    "authorize 出口被 Cloudflare 挑战（%s/%s）: %s",
+                    auth_attempt, auth_rotations, e,
+                )
+                if auth_attempt >= auth_rotations:
+                    raise
 
         continue_url = ""
         try:
@@ -3528,7 +4009,26 @@ class AuthFlow:
             os.getenv("LOCALAUTH_EXISTING_LOGIN_USE_LOGIN_HINT", "1")
         ).lower() in ("1", "true", "yes", "on")
 
-        if prefer_login_screen_first:
+        # authorize 已落在 /email-verification：真机这条链路就是“已有账号等 OTP”，
+        # 不需要再发 authorize/continue 探测（该接口在真机上已 0 次调用，且会 409）。
+        landing_lc = (self._authorize_landing_url or "").lower()
+        skip_login_probe = "/email-verification" in landing_lc
+        if skip_login_probe:
+            logger.info("已有账号：authorize 落地=/email-verification，跳过 authorize/continue 探测")
+            page_type = "email_otp_verification"
+            mode = ""
+            self._is_existing_account = True
+            self._existing_page_type = page_type
+            self._existing_email_verification_mode = mode
+
+        if prefer_login_screen_first and not skip_login_probe:
+            # 登录探测才需要 authorize_continue 的 sentinel；落地已判定 /email-verification
+            # 时走不到这里，单号省一次 ~20s PoW。
+            if not sentinel:
+                try:
+                    sentinel = self.get_sentinel_token(device_id)
+                except Exception as e:
+                    logger.warning(f"登录探测前获取 sentinel 失败，按空 token 探测: {e}")
             try:
                 logger.info("已有账号协议登录：优先走 login screen_hint 探测 password/otp 分支")
                 login_step = self.authorize_continue(
@@ -3604,12 +4104,28 @@ class AuthFlow:
                 mode = ""
 
         if not continue_url and page_type not in ("login_password", "email_otp_verification"):
-            is_new = self.signup(email, sentinel)
+            is_new = self.signup(
+                email,
+                sentinel,
+                landing_url=self._authorize_landing_url,
+                intent="login",
+                sentinel_provider=lambda: self.get_sentinel_token(device_id),
+            )
             if is_new:
                 logger.warning("目标邮箱未命中已有账号分支，回退到注册链路")
-                self.register_password(email)
-                otp_sent_at = time.time()
-                self.send_otp()
+                if self._should_set_password():
+                    self.register_password(email)
+                    otp_sent_at = time.time()
+                    self.send_otp()
+                else:
+                    # 密码默认关闭：signup 落的是 create-account/password 页，
+                    # 服务端还没发码 → 先用预访问建状态，再 passwordless 发码；
+                    # 失败再 send_otp 兜底。
+                    logger.info("已关闭注册密码（want_password=false），走无密码 OTP 注册")
+                    self._warm_create_account_password_page()
+                    otp_sent_at = time.time()
+                    if not self.kickoff_otp_delivery("register_no_password"):
+                        self.send_otp()
                 otp_code = mail_provider.wait_for_otp(
                     email,
                     timeout=otp_timeout,
@@ -3688,7 +4204,8 @@ class AuthFlow:
 
         if callback_url or continue_url:
             self.fetch_client_auth_session_dump("pre_oauth_exchange_protocol")
-            self.oauth_token_exchange(callback_url or "", continue_url or "")
+            if not self._env_flag("SKIP_OAUTH_TOKEN_EXCHANGE", "0"):
+                self.oauth_token_exchange(callback_url or "", continue_url or "")
             if (not self.result.refresh_token) and self._env_flag("OAUTH_CODEX_RT_EXCHANGE", "1"):
                 self.oauth_codex_rt_exchange(mail_provider=mail_provider)
             if (not self.result.refresh_token) and self._env_flag("OAUTH_SECONDARY_AUTHORIZE_EXCHANGE", "0"):

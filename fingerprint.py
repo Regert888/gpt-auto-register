@@ -49,12 +49,8 @@ _IOS_SAFARI_VERSIONS = [
         "webkit_ver": "605.1.15",
         "ios_versions": ["18_0", "18_1", "18_1_1"],
     },
-    {
-        "impersonate": "safari18_4_ios",
-        "safari_ver": "18.4",
-        "webkit_ver": "605.1.15",
-        "ios_versions": ["18_4", "18_4_1"],
-    },
+    # 注：safari18_4_ios 已移除 —— curl_cffi 0.16.3 的枚举里有它，但底层
+    # libcurl 实际请求时抛 ImpersonateError("is not supported")，整轮直接报废。
     {
         "impersonate": "safari260_ios",
         "safari_ver": "26.0",

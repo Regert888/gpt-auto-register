@@ -250,6 +250,9 @@ python register_outlook.py 'email----password----client_id----refresh_token'
 |---|---|---|
 | `PROXY` | - | 出口代理 URL，例 `socks5://user:pass@host:port`（curl_cffi 会自动 socks5→socks5h） |
 | `OTP_TIMEOUT` | `60` | OTP 等待秒数（实际下限 30） |
+| `REGISTER_SET_PASSWORD` | `0` | `1`=注册时设置密码（POST user/register）；`0`=无密码，走 passwordless 注册（邮箱 OTP） |
+| `WARMUP_ATTEMPTS` | `8` | chatgpt.com warmup 种 `oai-did` 的最大尝试次数（403 时 1.2s 快速换出口） |
+| `AUTH_IP_ROTATIONS` | `5` | authorize 被 Cloudflare 挑战时，最多换几个出口重跑整段认证链路 |
 | `WEBUI_ALLOW_LOGIN` | `0` | `1`=邮箱被识为已注册时走 OTP login；`0`=fast-fail 抛错 |
 | `SKIP_OAUTH_TOKEN_EXCHANGE` | `0` | `1`=跳过 OAuth refresh_token 交换 |
 | `OAUTH_CODEX_RT_EXCHANGE` | `1` | `1`=尝试 Codex OAuth 拿 refresh_token |
@@ -267,6 +270,12 @@ python register_outlook.py 'email----password----client_id----refresh_token'
 
 OpenAI 注册有概率被风控跳到 `add-phone` 步骤，**不绑手机号就拿不到 refresh_token**。
 WebUI「📱 接码配置」Tab 启用接码后，命中 add-phone 时会自动租号 + 等 SMS + 自动验证。
+
+> ⚠️ **Codex RT 实测（2026-11）**：正常新号的 Codex OAuth 授权会稳定落到
+> `session/select → continue_url=/add-phone`，去掉 `prompt` 重授权也一样；
+> 只有极少数“运气号”能直接过。**接码是常规路径，不是可选优化**。
+> 未配置接码时，号仍可注册成功（session / access_token 可用），但拿不到 refresh_token。
+> v0.5.8 曾出现“无需接码”的现象，那是临时 bug，后续版本已修正，不要依赖。
 
 ### 支持的平台
 

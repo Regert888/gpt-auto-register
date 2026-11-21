@@ -166,6 +166,8 @@ def _do_register(
         proxy: Optional[str]
         otp_timeout: int
         allow_existing_login: bool
+        want_password: bool   # 默认 False = 无密码注册（passwordless OTP）
+        want_2fa: bool        # 默认 False = 不绑 TOTP
     """
     # 先认领本线程，再挂 handler —— 顺序不能反：中间要是有日志产生，
     # 没打标记的话会被广播到其他并发 run 的日志里去。
@@ -202,6 +204,9 @@ def _do_register(
         # 单号 WebUI 场景下 fast-fail 没意义（批量跑才需要"跳过被识别的号"），故强制 ON。
         env_overrides["WEBUI_ALLOW_LOGIN"] = "1"
         env_overrides["OTP_TIMEOUT"] = str(int(options.get("otp_timeout") or 180))
+        # 注册密码：默认关闭（want_password 缺省 False）。关闭时 auth_flow 走
+        # passwordless 注册（邮箱 OTP），不 POST user/register；开启才生成并落库密码。
+        env_overrides["REGISTER_SET_PASSWORD"] = "1" if options.get("want_password", False) else "0"
         # 用户不要 refresh_token → 直接跳过 Codex OAuth（每次都失败浪费 ~10s + 一堆告警）
         if not options.get("want_refresh_token", True):
             env_overrides["SKIP_OAUTH_TOKEN_EXCHANGE"] = "1"
